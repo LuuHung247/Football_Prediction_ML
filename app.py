@@ -1,4 +1,5 @@
 import os
+import base64
 import json
 from typing import Any, Dict, List, Tuple
 
@@ -61,6 +62,99 @@ def split_features_targets(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, p
     y_away = df[TARGET_AWAY].astype(float)
     return X, y_home, y_away
 
+
+def _safe_name(name: str) -> str:
+    return (
+        str(name).lower()
+        .replace(" ", "_")
+        .replace("/", "-")
+        .replace("&", "and")
+        .replace(".", "")
+        .replace("'", "")
+    )
+
+
+def get_logo_path(team_name: str) -> str:
+    logos_dir = os.path.join(os.getcwd(), "assets", "logos")
+
+    # Known aliases for dataset naming vs. file naming
+    alias_map = {
+        "nott'm_forest": "nottingham_forest",
+        "man_utd": "man_united",
+        "man_city": "man_city",
+    }
+
+    base = _safe_name(team_name)
+
+    # Variant that preserves apostrophes (older downloaded filenames)
+    keep_apostrophe = (
+        str(team_name).lower().replace(" ", "_").replace("/", "-").replace("&", "and").replace(".", "")
+    )
+
+    candidates = [
+        base,
+        alias_map.get(base, base),
+        keep_apostrophe,
+    ]
+
+    for stem in candidates:
+        fpath = os.path.join(logos_dir, f"{stem}.png")
+        if os.path.exists(fpath):
+            return fpath
+
+    # Fallback to the first expected path
+    return os.path.join(logos_dir, f"{base}.png")
+
+
+def render_logo(team_name: str, box_size: int = 120):
+    path = get_logo_path(team_name)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        html = f'''<div style="width:{box_size}px;height:{box_size}px;display:flex;align-items:center;justify-content:center;">
+  <img src="data:image/png;base64,{b64}" style="max-width:100%;max-height:100%;object-fit:contain;"/>
+</div>'''
+        st.markdown(html, unsafe_allow_html=True)
+    except Exception:
+        # fallback to streamlit image with fixed width
+        st.image(path, caption=team_name, width=box_size)
+
+
+def _logo_b64(team_name: str) -> str:
+    path = get_logo_path(team_name)
+    if not os.path.exists(path):
+        return ""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def render_scoreboard(home_team: str, away_team: str, g_home: int, g_away: int):
+    b64_home = _logo_b64(home_team)
+    b64_away = _logo_b64(away_team)
+    html = f'''
+    <div style="margin-top:8px;border-radius:12px;background:#1f2937;padding:16px;">
+      <div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;color:#e5e7eb;">
+        <div style="text-align:center;">
+          <img src="data:image/png;base64,{b64_home}" style="width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px;"/>
+          <div style="font-size:16px;">{home_team}</div>
+        </div>
+        <div style="text-align:center;">
+          <div style="font-weight:700;font-size:52px;line-height:1;letter-spacing:1px;">
+            {g_home}
+            <span style="opacity:.7;margin:0 16px;">-</span>
+            {g_away}
+          </div>
+        </div>
+        <div style="text-align:center;">
+          <img src="data:image/png;base64,{b64_away}" style="width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px;"/>
+          <div style="font-size:16px;">{away_team}</div>
+        </div>
+      </div>
+    </div>
+    '''
+    st.markdown(html, unsafe_allow_html=True)
 
 
 
@@ -223,6 +317,31 @@ with col_left:
                 key="away_select",
             )
         predict_btn = st.button("Dự đoán tỉ số")
+        # Persist scoreboard and show ?-? before prediction
+        teams_key = f"{home_team}__{away_team}" if home_team and away_team else None
+        prev_key = st.session_state.get("_teams_key")
+        if teams_key and teams_key != prev_key:
+            st.session_state["_teams_key"] = teams_key
+            st.session_state["_score_home"] = None
+            st.session_state["_score_away"] = None
+
+        if predict_btn:
+            if not home_team or not away_team:
+                st.error("Vui lòng chọn đội nhà và đội khách hợp lệ.")
+            elif home_team == away_team:
+                st.error("Đội nhà và đội khách không được trùng nhau.")
+            else:
+                X_row = build_input_row(df, home_team, away_team)
+                g_home, g_away = predict_score(model_home, model_away, X_row)
+                st.session_state["_score_home"] = g_home
+                st.session_state["_score_away"] = g_away
+
+        disp_home = st.session_state.get("_score_home")
+        disp_away = st.session_state.get("_score_away")
+        disp_home = disp_home if disp_home is not None else "?"
+        disp_away = disp_away if disp_away is not None else "?"
+        if home_team and away_team:
+            render_scoreboard(home_team, away_team, disp_home, disp_away)
 
 with col_right:
     st.subheader("Chất lượng mô hình")
@@ -262,19 +381,7 @@ with col_right:
         st.metric("R2 (Away)", _fmt(metrics, "test", "away", "R2"))
 
 st.markdown("---")
-output_col1, output_col2 = st.columns([1, 2])
-
-with output_col1:
-    st.subheader("Kết quả dự đoán")
-    if predict_btn:
-        if not home_team or not away_team:
-            st.error("Vui lòng chọn đội nhà và đội khách hợp lệ.")
-        elif home_team == away_team:
-            st.error("Đội nhà và đội khách không được trùng nhau.")
-        else:
-            X_row = build_input_row(df, home_team, away_team)
-            g_home, g_away = predict_score(model_home, model_away, X_row)
-            st.success(f"Dự đoán: {home_team} {g_home} - {g_away} {away_team}")
+output_col2 = st.container()
 
 with output_col2:
     st.subheader("Đầu vào ước lượng (từ thống kê lịch sử)")
