@@ -189,32 +189,40 @@ if "_cache_models" not in st.session_state:
 
 df, model_home, model_away, metrics = st.session_state.get("_cache_models", load_models_and_metrics(data_path))
 
+# Only allow teams present in the Test season 2024-07-01 → 2025-06-30
+test_start = pd.Timestamp("2024-07-01")
+test_end = pd.Timestamp("2025-06-30")
+df_test = df[(df["Date"] >= test_start) & (df["Date"] <= test_end)]
 teams_sorted = sorted(
-    set(df.get("HomeTeam", pd.Series(dtype=str)).dropna().unique())
-    | set(df.get("AwayTeam", pd.Series(dtype=str)).dropna().unique())
+    set(df_test.get("HomeTeam", pd.Series(dtype=str)).dropna().unique())
+    | set(df_test.get("AwayTeam", pd.Series(dtype=str)).dropna().unique())
 )
 
 col_left, col_right = st.columns([1, 1])
 with col_left:
-    st.subheader("Chọn cặp đấu")
-    home_team = st.selectbox(
-        "Đội nhà",
-        options=teams_sorted,
-        index=0 if teams_sorted else None,
-        key="home_select",
-    )
-    away_options = [t for t in teams_sorted if t != home_team]
-    if not away_options:
-        st.warning("Dataset chỉ có 1 đội, không thể chọn đội khách khác.")
-        away_team = None
+    st.subheader("Chọn cặp đấu (chỉ đội trong tập Test 2024-2025)")
+    if len(teams_sorted) == 0:
+        st.error("Không tìm thấy đội nào trong tập Test 2024-2025.")
+        home_team, away_team, predict_btn = None, None, False
     else:
-        away_team = st.selectbox(
-            "Đội khách",
-            options=away_options,
-            index=0 if away_options else None,
-            key="away_select",
+        home_team = st.selectbox(
+            "Đội nhà",
+            options=teams_sorted,
+            index=0,
+            key="home_select",
         )
-    predict_btn = st.button("Dự đoán tỉ số")
+        away_options = [t for t in teams_sorted if t != home_team]
+        if not away_options:
+            st.warning("Tập test chỉ có 1 đội, không thể chọn đội khách khác.")
+            away_team = None
+        else:
+            away_team = st.selectbox(
+                "Đội khách",
+                options=away_options,
+                index=0,
+                key="away_select",
+            )
+        predict_btn = st.button("Dự đoán tỉ số")
 
 with col_right:
     st.subheader("Chất lượng mô hình")
