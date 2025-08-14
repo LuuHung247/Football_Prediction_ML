@@ -7,18 +7,19 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from joblib import load
+from sklearn.preprocessing import StandardScaler
 
 
 # -------------------------
 # Config & Constants
 # -------------------------
 st.set_page_config(
-    page_title="Dự đoán tỉ số bóng đá (XGBoost)",
+    page_title="Dự đoán tỉ số bóng đá",
     page_icon="⚽",
     layout="wide",
 )
 
-DEFAULT_DATA_PATH = os.path.join(os.getcwd(), "dataset", "data.csv")
+DEFAULT_DATA_PATH = os.path.join(os.getcwd(), "dataset", "data_baseline.csv")
 MODEL_HOME_PATH = os.path.join(os.getcwd(), "models", "home_rf_model.pkl")
 MODEL_AWAY_PATH = os.path.join(os.getcwd(), "models", "away_rf_model.pkl")
 FEATURE_COLS_PATH = os.path.join(os.getcwd(), "models", "feature_cols.json")
@@ -52,6 +53,23 @@ def read_dataset(csv_path: str) -> pd.DataFrame:
             continue
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    return df
+
+
+# -------------------------
+# Feature engineering (as in notebook)
+# -------------------------
+def feature_engineering_df(df: pd.DataFrame) -> pd.DataFrame:
+    if {"Elo_H_before", "Elo_A_before"}.issubset(df.columns):
+        df["Elo_diff"] = df["Elo_H_before"] - df["Elo_A_before"]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            df["Elo_ratio"] = df["Elo_H_before"] / df["Elo_A_before"]
+    if {"GoalsScore_H_avg", "GoalsAgainst_A_avg"}.issubset(df.columns):
+        df["Goals_likelyhood_H"] = df["GoalsScore_H_avg"] + df["GoalsAgainst_A_avg"]
+    if {"GoalsScore_A_avg", "GoalsAgainst_H_avg"}.issubset(df.columns):
+        df["Goals_likelyhood_A"] = df["GoalsScore_A_avg"] + df["GoalsAgainst_H_avg"]
+    if {"Elo_H_before", "Home_adv_elo"}.issubset(df.columns):
+        df["Home_adv_elo_sum"] = df["Elo_H_before"] + df["Home_adv_elo"]
     return df
 
 
@@ -165,10 +183,6 @@ def render_scoreboard(home_team: str, away_team: str, g_home: int, g_away: int):
 @st.cache_resource(show_spinner=True)
 def load_models_and_metrics(csv_path: str):
     df = read_dataset(csv_path)
-    if "Date" not in df.columns:
-        st.error("Cột 'Date' không tồn tại trong dữ liệu.")
-        st.stop()
-    df = df.dropna(subset=["Date"]).copy()
 
     if not (os.path.exists(MODEL_HOME_PATH) and os.path.exists(MODEL_AWAY_PATH)):
         st.error("Chưa có mô hình. Vui lòng mở notebook 'eda_and_train.ipynb' để huấn luyện và lưu mô hình vào ./models/.")
@@ -212,7 +226,20 @@ def load_models_and_metrics(csv_path: str):
     except Exception:
         inferred_map = {}
 
-    return df, model_home, model_away, feature_cols, (team_to_code or inferred_map)
+    # Fit StandardScaler on full dataset (feature-engineered), mirroring notebook
+    df_fe = feature_engineering_df(df.copy())
+    exclude_norm = {TARGET_HOME, TARGET_AWAY}
+    cols_to_norm = (
+        df_fe.select_dtypes(include=["int64", "float64"]).columns.difference(exclude_norm)
+    )
+    cols_to_norm = [c for c in cols_to_norm if c not in ["HomeTeam_code", "AwayTeam_code"]]
+    scaler = StandardScaler()
+    try:
+        scaler.fit(df_fe.loc[:, cols_to_norm])
+    except Exception:
+        pass
+
+    return df, model_home, model_away, feature_cols, (team_to_code or inferred_map), cols_to_norm, scaler
 
 
 def _mean_or_nan(series: pd.Series) -> float:
@@ -222,7 +249,123 @@ def _mean_or_nan(series: pd.Series) -> float:
     return float(series.mean())
 
 
-def build_input_row(
+def preprocessing(
+    df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+    feature_cols: List[str],
+    team_to_code: Dict[str, int],
+    cols_to_norm: List[str],
+    scaler: Any | None,
+) -> pd.DataFrame:
+    """Construct a single-row feature DataFrame for a given matchup by aggregating
+    team-specific historical statistics from the dataset.
+
+    Heuristics:
+    - Columns ending with _H: take mean over matches where team played at Home.
+    - Columns ending with _A: take mean over matches where team played Away.
+    - Other numeric columns: prefer head-to-head mean for this pairing; fallback to
+      per-team means (home or away as available); else global mean.
+    """
+    feature_columns: List[str] = [c for c in df.columns if c not in EXCLUDE_COLUMNS]
+
+    row: Dict[str, float] = {}
+
+    # Ensure categorical fields present
+    for cat in CATEGORICAL_FEATURES:
+        if cat not in feature_columns:
+            feature_columns.append(cat)
+
+    # Populate categorical names
+    row["HomeTeam"] = home_team
+    row["AwayTeam"] = away_team
+    # And codes expected by the model
+    row["HomeTeam_code"] = float(team_to_code.get(home_team, np.nan))
+    row["AwayTeam_code"] = float(team_to_code.get(away_team, np.nan))
+
+    # Numeric columns
+    numeric_cols = [
+        c for c in feature_columns if c not in CATEGORICAL_FEATURES and c != "Date"
+    ]
+
+    # Pre-computed masks for speed
+    mask_home = df["HomeTeam"] == home_team
+    mask_away = df["AwayTeam"] == away_team
+    mask_h2h = mask_home & mask_away
+
+    for col in numeric_cols:
+        if col.endswith("_H"):
+            val = _mean_or_nan(df.loc[mask_home, col])
+        elif col.endswith("_A"):
+            val = _mean_or_nan(df.loc[mask_away, col])
+        else:
+            # Prefer direct head-to-head context for this pairing
+            val = _mean_or_nan(df.loc[mask_h2h, col])
+            if np.isnan(val):
+                # Fallback to team-position means
+                v_home = _mean_or_nan(df.loc[mask_home, col])
+                v_away = _mean_or_nan(df.loc[mask_away, col])
+                if np.isnan(v_home) and np.isnan(v_away):
+                    val = _mean_or_nan(df[col])
+                else:
+                    val = float(np.nanmean([v_home, v_away]))
+
+        if np.isnan(val):
+            # Ultimate fallback: global median
+            try:
+                val = float(df[col].median())
+            except Exception:
+                val = 0.0
+        row[col] = val
+
+    # Compute derived features if model expects them
+    if "Elo_diff" in feature_cols and "Elo_diff" not in row:
+        row["Elo_diff"] = float(row.get("Elo_H_before", 0.0)) - float(row.get("Elo_A_before", 0.0))
+    if "Elo_ratio" in feature_cols and "Elo_ratio" not in row:
+        denom = float(row.get("Elo_A_before", 1.0)) or 1.0
+        row["Elo_ratio"] = float(row.get("Elo_H_before", 0.0)) / denom
+    if "Home_adv_elo_sum" in feature_cols and "Home_adv_elo_sum" not in row:
+        row["Home_adv_elo_sum"] = float(row.get("Home_adv_elo", 0.0))
+    if "Goals_likelyhood_H" in feature_cols and "Goals_likelyhood_H" not in row:
+        row["Goals_likelyhood_H"] = float(np.nanmean([
+            row.get("GoalsScore_H_avg", np.nan),
+            row.get("GoalsAgainst_A_avg", np.nan),
+        ])) if not (np.isnan(row.get("GoalsScore_H_avg", np.nan)) and np.isnan(row.get("GoalsAgainst_A_avg", np.nan))) else 0.0
+    if "Goals_likelyhood_A" in feature_cols and "Goals_likelyhood_A" not in row:
+        row["Goals_likelyhood_A"] = float(np.nanmean([
+            row.get("GoalsScore_A_avg", np.nan),
+            row.get("GoalsAgainst_H_avg", np.nan),
+        ])) if not (np.isnan(row.get("GoalsScore_A_avg", np.nan)) and np.isnan(row.get("GoalsAgainst_H_avg", np.nan))) else 0.0
+
+    # Build DataFrame and align to training feature columns order
+    row_df = pd.DataFrame([row])
+    # Ensure all required columns exist
+    for col in feature_cols:
+        if col not in row_df.columns:
+            row_df[col] = 0.0
+    # Select and order
+    row_df = row_df[feature_cols]
+    # Coerce to numeric where possible
+    for col in row_df.columns:
+        if col not in CATEGORICAL_FEATURES:
+            row_df[col] = pd.to_numeric(row_df[col], errors="coerce")
+    # Fill NaNs: if codes missing, don't silently zero – try fallback based on overall index
+    if np.isnan(row_df["HomeTeam_code"].iloc[0]) or np.isnan(row_df["AwayTeam_code"].iloc[0]):
+        st.warning("Thiếu mã đội (code) cho một trong hai đội. Đang dùng suy luận tạm thời.")
+    row_df = row_df.fillna(row_df.median(numeric_only=True)).fillna(0.0)
+    # Apply feature engineering to the single-row frame to ensure derived cols exist
+    row_df = feature_engineering_df(row_df)
+
+    # Apply normalization via StandardScaler
+    if scaler is not None and cols_to_norm:
+        try:
+            row_df.loc[:, cols_to_norm] = scaler.transform(row_df.loc[:, cols_to_norm])
+        except Exception:
+            pass
+
+    return row_df
+
+def show_stats(
     df: pd.DataFrame,
     home_team: str,
     away_team: str,
@@ -324,8 +467,11 @@ def build_input_row(
     if np.isnan(row_df["HomeTeam_code"].iloc[0]) or np.isnan(row_df["AwayTeam_code"].iloc[0]):
         st.warning("Thiếu mã đội (code) cho một trong hai đội. Đang dùng suy luận tạm thời.")
     row_df = row_df.fillna(row_df.median(numeric_only=True)).fillna(0.0)
-    return row_df
+    # Apply feature engineering to the single-row frame to ensure derived cols exist
+    row_df = feature_engineering_df(row_df)
 
+
+    return row_df
 
 def predict_score(model_home: Any, model_away: Any, X_row: pd.DataFrame) -> Tuple[int, int]:
     pred_home = float(model_home.predict(X_row)[0])
@@ -348,17 +494,16 @@ data_path = DEFAULT_DATA_PATH
 
 if "_cache_models" not in st.session_state:
     with st.spinner("Đang tải mô hình đã huấn luyện..."):
-        df, model_home, model_away, feature_cols, team_to_code = load_models_and_metrics(data_path)
-        st.session_state["_cache_models"] = (df, model_home, model_away, feature_cols, team_to_code)
+        df, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler = load_models_and_metrics(data_path)
+        st.session_state["_cache_models"] = (df, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler)
 
-df, model_home, model_away, feature_cols, team_to_code = st.session_state.get(
+df, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler = st.session_state.get(
     "_cache_models", load_models_and_metrics(data_path)
 )
 
 # Only allow teams present in the Test season 2024-07-01 → 2025-06-30
-test_start = pd.Timestamp("2024-07-01")
-test_end = pd.Timestamp("2025-06-30")
-df_test = df[(df["Date"] >= test_start) & (df["Date"] <= test_end)]
+
+df_test = df.copy()
 teams_sorted = sorted(
     set(df_test.get("HomeTeam", pd.Series(dtype=str)).dropna().unique())
     | set(df_test.get("AwayTeam", pd.Series(dtype=str)).dropna().unique())
@@ -399,7 +544,7 @@ with main_col:
         st.session_state["_score_away"] = None
 
     if predict_btn and home_team and away_team and home_team != away_team:
-        X_row = build_input_row(df, home_team, away_team, feature_cols, team_to_code)
+        X_row = preprocessing(df, home_team, away_team, feature_cols, team_to_code, cols_to_norm, scaler)
         g_home, g_away = predict_score(model_home, model_away, X_row)
         st.session_state["_score_home"] = g_home
         st.session_state["_score_away"] = g_away
@@ -425,31 +570,13 @@ with main_col:
             except Exception as e:
                 st.write(f"Không thể hiển thị debug: {e}")
 
-    # Head-to-head (last 5, exclude Test period)
-    if home_team and away_team and home_team != away_team:
-        try:
-            mask_pair = (
-                ((df.get("HomeTeam") == home_team) & (df.get("AwayTeam") == away_team))
-                |
-                ((df.get("HomeTeam") == away_team) & (df.get("AwayTeam") == home_team))
-            )
-            mask_time = df.get("Date") < test_start
-            df_h2h = df[mask_pair & mask_time][["Date", "HomeTeam", "AwayTeam", TARGET_HOME, TARGET_AWAY]].dropna()
-            df_h2h = df_h2h.sort_values("Date", ascending=False).head(5).copy()
-            df_h2h["Date"] = pd.to_datetime(df_h2h["Date"], errors="coerce").dt.date.astype(str)
-            df_h2h = df_h2h.rename(columns={TARGET_HOME: "FT_Home", TARGET_AWAY: "FT_Away"})
-            st.subheader("Đối đầu gần nhất (tối đa 5 trận)")
-            st.dataframe(df_h2h.reset_index(drop=True), use_container_width=True)
-        except Exception:
-            st.info("Không lấy được lịch sử đối đầu.")
+   
 
     st.markdown("---")
     st.subheader("Đầu vào ước lượng (từ thống kê lịch sử)")
     if predict_btn and home_team and away_team and home_team != away_team:
-        st.dataframe(
-            build_input_row(df, home_team, away_team, feature_cols, team_to_code).T.rename(columns={0: "Giá trị"}),
-            use_container_width=True,
-        )
+        X_row = show_stats(df, home_team, away_team, feature_cols, team_to_code)
+        st.dataframe(X_row.T.rename(columns={0: "Giá trị"}), use_container_width=True)
 
     with st.expander("Ghi chú & Hướng dẫn"):
         st.markdown(
