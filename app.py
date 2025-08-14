@@ -20,6 +20,7 @@ st.set_page_config(
 )
 
 DEFAULT_DATA_PATH = os.path.join(os.getcwd(), "dataset", "data_baseline.csv")
+H2H_DATA_PATH = os.path.join(os.getcwd(), "dataset", "data.csv")
 MODEL_HOME_PATH = os.path.join(os.getcwd(), "models", "home_rf_model.pkl")
 MODEL_AWAY_PATH = os.path.join(os.getcwd(), "models", "away_rf_model.pkl")
 FEATURE_COLS_PATH = os.path.join(os.getcwd(), "models", "feature_cols.json")
@@ -55,9 +56,337 @@ def read_dataset(csv_path: str) -> pd.DataFrame:
 
     return df
 
+# -------------------------
+# Create Custome dataset
+# -------------------------
+
+def process_full_features(df_base, new_df=None, k=5, init_elo=1500, adv_const=0.05, elo_scale=150.0, K=20):
+    df_base["Date"] = pd.to_datetime(df_base["Date"], dayfirst=True)
+    
+    if new_df is not None:
+        new_df["Date"] = pd.to_datetime(new_df["Date"], dayfirst=True)
+        df_base = pd.concat([df_base, new_df], ignore_index=True)
+    
+    df = df_base.sort_values("Date").reset_index(drop=True)
+    df.index.name = "MatchID"
+
+    ### Part 1: Win rate home/away
+    long = pd.concat([
+        pd.DataFrame({
+            "MatchID": df.index,
+            "Date": df["Date"],
+            "Team": df["HomeTeam"],
+            "is_home": True,
+            "GF": df["Full Time Home Goals"],
+            "GA": df["Full Time Away Goals"]
+        }),
+        pd.DataFrame({
+            "MatchID": df.index,
+            "Date": df["Date"],
+            "Team": df["AwayTeam"],
+            "is_home": False,
+            "GF": df["Full Time Away Goals"],
+            "GA": df["Full Time Home Goals"]
+        })
+    ], ignore_index=True)
+
+    long["ResultNum"] = np.sign(long["GF"] - long["GA"])
+    long["WinFlag"] = (long["ResultNum"] == 1).astype(float)
+    long = long.sort_values(["Team", "Date", "MatchID"]).reset_index(drop=True)
+
+    # Win rate k trận sân nhà
+    def compute_win_rate_k(df, is_home=True):
+        result = []
+        for team, g in df[df["is_home"] == is_home].groupby("Team", sort=False):
+            wins_hist = []
+            for _, r in g.iterrows():
+                rate = sum(wins_hist) / len(wins_hist) if wins_hist else 0.0
+                result.append((r["MatchID"], team, rate))
+                wins_hist.append(r["WinFlag"])
+                if len(wins_hist) > k:
+                    wins_hist.pop(0)
+        return pd.DataFrame(result, columns=["MatchID", "Team", f'{"home" if is_home else "away"}_win_rate_k'])
+
+    home_rate_df = compute_win_rate_k(long, True)
+    away_rate_df = compute_win_rate_k(long, False)
+
+    df = df.merge(home_rate_df.rename(columns={"Team": "HomeTeam"}), on=["MatchID", "HomeTeam"], how="left") \
+           .merge(away_rate_df.rename(columns={"Team": "AwayTeam"}), on=["MatchID", "AwayTeam"], how="left")
+    
+    df[["home_win_rate_k", "away_win_rate_k"]] = df[["home_win_rate_k", "away_win_rate_k"]].fillna(0.0)
+    df["Home_adv"] = df["home_win_rate_k"] - df["away_win_rate_k"] + adv_const
+    df["Home_adv_elo"] = elo_scale * df["Home_adv"]
+
+    ### Part 2: ELO
+    teams = pd.unique(pd.concat([df["HomeTeam"], df["AwayTeam"]], ignore_index=True))
+    elo = {team: float(init_elo) for team in teams}
+
+    eH, eA = [], []
+    for _, row in df.iterrows():
+        h, a = row["HomeTeam"], row["AwayTeam"]
+        Rh, Ra = elo[h], elo[a]
+        eH.append(Rh)
+        eA.append(Ra)
+
+        h_adv = row["Home_adv_elo"]
+        Rdiff = (Rh + h_adv) - Ra
+        We = 1.0 / (1.0 + 10 ** (-Rdiff / 400.0))
+        hg, ag = row["Full Time Home Goals"], row["Full Time Away Goals"]
+        W = 1.0 if hg > ag else (0.5 if hg == ag else 0.0)
+
+        margin = abs(hg - ag)
+        G = (np.log1p(margin) if margin > 0 else 1.0) * (2.2 / (0.001 * abs(Rdiff) + 2.2))
+        delta = K * G * (W - We)
+
+        elo[h] += delta
+        elo[a] -= delta
+
+    df["Elo_H_before"] = eH
+    df["Elo_A_before"] = eA
+
+    ### Part 3: Team split stats (WinStreak, Goals scored/conceded, etc.)
+    def expand_team_view(df):
+        home = pd.DataFrame({
+            "MatchID": df.index, "Date": df["Date"], "Team": df["HomeTeam"],
+            "Opponent": df["AwayTeam"], "is_home": True,
+            "GS": df["Full Time Home Goals"], "GA": df["Full Time Away Goals"]
+        })
+        away = pd.DataFrame({
+            "MatchID": df.index, "Date": df["Date"], "Team": df["AwayTeam"],
+            "Opponent": df["HomeTeam"], "is_home": False,
+            "GS": df["Full Time Away Goals"], "GA": df["Full Time Home Goals"]
+        })
+        return pd.concat([home, away], ignore_index=True)
+
+    split = expand_team_view(df)
+    split["ResultNum"] = np.sign(split["GS"] - split["GA"])
+    split = split.sort_values(["Team", "Date", "MatchID"]).reset_index(drop=True)
+
+    GS_shift = split.groupby("Team")["GS"].shift(1)
+    GA_shift = split.groupby("Team")["GA"].shift(1)
+
+    rolling_count = GS_shift.groupby(split["Team"]).rolling(window=k, min_periods=1).count().reset_index(level=0, drop=True)
+    split["GS_k"] = GS_shift.groupby(split["Team"]).rolling(window=k, min_periods=1).sum().reset_index(level=0, drop=True)
+    split["GA_k"] = GA_shift.groupby(split["Team"]).rolling(window=k, min_periods=1).sum().reset_index(level=0, drop=True)
+    split["GD_k"] = split["GS_k"] - split["GA_k"]
+
+    WinFlag = (split["ResultNum"] == 1).astype(int).groupby(split["Team"]).shift(1)
+    LossFlag = (split["ResultNum"] == -1).astype(int).groupby(split["Team"]).shift(1)
+    split["Wins_k"] = WinFlag.groupby(split["Team"]).rolling(window=k, min_periods=1).sum().reset_index(level=0, drop=True)
+    split["Losses_k"] = LossFlag.groupby(split["Team"]).rolling(window=k, min_periods=1).sum().reset_index(level=0, drop=True)
+    split["WinRate_k"] = split["Wins_k"] / rolling_count
+    split["GS_avg_k"] = split["GS_k"] / rolling_count
+    split["GA_avg_k"] = split["GA_k"] / rolling_count
+
+    # Win/Lose Streak
+    prev_result = split.groupby("Team")["ResultNum"].shift(1).fillna(0).astype(int)
+    win_streak = np.zeros(len(split))
+    lose_streak = np.zeros(len(split))
+    for _, idxs in split.groupby("Team").indices.items():
+        w = l = 0
+        for pos in idxs:
+            x = int(prev_result.iloc[pos])
+            w = w + 1 if x == 1 else 0
+            l = l + 1 if x == -1 else 0
+            win_streak[pos] = min(w, k)
+            lose_streak[pos] = min(l, k)
+
+    split["WinStreak"] = win_streak.astype(int)
+    split["LoseStreak"] = lose_streak.astype(int)
+
+    # Merge lại về từng trận đấu
+    features = ["MatchID","Team","is_home","GS_k","GA_k","GD_k","Wins_k","Losses_k",
+                "WinRate_k","WinStreak","LoseStreak","GS_avg_k","GA_avg_k"]
+
+    home_df = split[split["is_home"]][features].rename(columns={
+        "Team":"HomeTeam","GS_k":"GoalsScore_H","GA_k":"GoalsAgainst_H","GD_k":"GoalDifference_H",
+        "Wins_k":"Wins_H","Losses_k":"Losses_H","WinRate_k":"WinRate_H","WinStreak":"WinStreak_H",
+        "LoseStreak":"LoseStreak_H","GS_avg_k":"GoalsScore_H_avg","GA_avg_k":"GoalsAgainst_H_avg"
+    }).drop(columns="is_home")
+
+    away_df = split[~split["is_home"]][features].rename(columns={
+        "Team":"AwayTeam","GS_k":"GoalsScore_A","GA_k":"GoalsAgainst_A","GD_k":"GoalDifference_A",
+        "Wins_k":"Wins_A","Losses_k":"Losses_A","WinRate_k":"WinRate_A","WinStreak":"WinStreak_A",
+        "LoseStreak":"LoseStreak_A","GS_avg_k":"GoalsScore_A_avg","GA_avg_k":"GoalsAgainst_A_avg"
+    }).drop(columns="is_home")
+
+    df = (
+        df.reset_index()
+        .merge(home_df, on=["MatchID","HomeTeam"], how="left")
+        .merge(away_df, on=["MatchID","AwayTeam"], how="left")
+    )
+
+    ### Part 4: Head2Head
+    df_sorted = df.sort_values(["Date","MatchID"]).reset_index()
+    matches_hist = defaultdict(deque)
+    prev_matchs, h2h_gs_H_total, h2h_gs_A_total, h2h_gs_H_avg, h2h_gs_A_avg = {}, {}, {}, {}, {}
+
+    for _, row in df_sorted.iterrows():
+        h, a = row["HomeTeam"], row["AwayTeam"]
+        key = tuple(sorted((h, a)))
+        past = list(matches_hist[key])
+
+        total = sum(1 if t[0] == h and t[1] == 1 else -1 if t[0] == a and t[1] == 1 else 0 for t in past)
+        goals_H_total = sum(t[2] if t[0] == h else t[3] for t in past)
+        goals_A_total = sum(t[3] if t[0] == h else t[2] for t in past)
+        count = len(past)
+
+        idx = row["index"]
+        prev_matchs[idx] = total
+        h2h_gs_H_total[idx] = goals_H_total
+        h2h_gs_A_total[idx] = goals_A_total
+        h2h_gs_H_avg[idx] = goals_H_total / count if count else 0.0
+        h2h_gs_A_avg[idx] = goals_A_total / count if count else 0.0
+
+        matches_hist[key].append((h, np.sign(row["Full Time Home Goals"] - row["Full Time Away Goals"]),
+                                  row["Full Time Home Goals"], row["Full Time Away Goals"]))
+
+    df["H2H_score"] = df.index.to_series().map(prev_matchs)
+    df["H2H_GS_H_total"] = df.index.to_series().map(h2h_gs_H_total)
+    df["H2H_GS_A_total"] = df.index.to_series().map(h2h_gs_A_total)
+    df["H2H_GS_H_avg"] = df.index.to_series().map(h2h_gs_H_avg)
+    df["H2H_GS_A_avg"] = df.index.to_series().map(h2h_gs_A_avg)
+
+    # Final selected columns
+    final_cols = [
+        "Date","HomeTeam","AwayTeam","Elo_H_before","Elo_A_before", 
+        "GoalsScore_H","GoalsAgainst_H","GoalDifference_H",
+        "WinStreak_H","LoseStreak_H","Wins_H","Losses_H","WinRate_H",
+        "GoalsScore_H_avg", "GoalsAgainst_H_avg", 
+        "Home_adv_elo",
+        "GoalsScore_A","GoalsAgainst_A","GoalDifference_A",
+        "WinStreak_A","LoseStreak_A","Wins_A","Losses_A","WinRate_A",
+        "GoalsScore_A_avg", "GoalsAgainst_A_avg",
+        "H2H_score","H2H_GS_H_total", "H2H_GS_A_total", "H2H_GS_H_avg",
+        "H2H_GS_A_avg", "Full Time Home Goals", "Full Time Away Goals"
+    ]
+    return df[final_cols].sort_values("Date").reset_index(drop=True)
+
+
+def prepare_features_for_prediction(
+    folder="data_season",
+    new_data=None,
+    baseline_path="data_extra/new_season.csv",
+    k=5,
+    init_elo=1500,
+    adv_const=0.05,
+    elo_scale=150.0,
+    K=20
+):
+    # Load historical data
+    files = sorted(Path(folder).glob("*.csv"), key=lambda p: p.stem)
+    df_hist_raw = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+    df_hist_raw["Date"] = pd.to_datetime(df_hist_raw["Date"], dayfirst=True)
+
+    # Nếu có new_data
+    if new_data is not None:
+        new_df = pd.DataFrame(new_data)
+
+        # Nếu không có Date, tự động sinh từ ngày cuối cùng
+        if "Date" not in new_df.columns or new_df["Date"].isna().all():
+            last_date = df_hist_raw["Date"].max()
+            new_df["Date"] = [last_date + pd.Timedelta(days=i+1) for i in range(len(new_df))]
+        else:
+            new_df["Date"] = pd.to_datetime(new_df["Date"], dayfirst=True)
+    else:
+        new_df = None
+
+    # Process full historical + new matches
+    df_hist = process_full_features(
+        df_hist_raw, 
+        new_df=new_df, 
+        k=k, init_elo=init_elo,
+        adv_const=adv_const, elo_scale=elo_scale, K=K
+    ).fillna(0)
+
+    # Load baseline
+    df_baseline = pd.read_csv(baseline_path)
+
+    # ===== Các bước giữ nguyên như cũ =====
+    # Elo
+    elo_latest = {}
+    for team in pd.unique(pd.concat([df_hist["HomeTeam"], df_hist["AwayTeam"]], ignore_index=True)):
+        last_home = df_hist[df_hist["HomeTeam"] == team][["Elo_H_before"]].tail(1)
+        last_away = df_hist[df_hist["AwayTeam"] == team][["Elo_A_before"]].tail(1)
+        last = pd.concat([last_home.rename(columns={"Elo_H_before": "Elo"}),
+                          last_away.rename(columns={"Elo_A_before": "Elo"})])
+        elo_latest[team] = last["Elo"].iloc[-1] if not last.empty else init_elo
+
+    df_baseline["Elo_H_before"] = df_baseline["HomeTeam"].map(elo_latest).fillna(init_elo)
+    df_baseline["Elo_A_before"] = df_baseline["AwayTeam"].map(elo_latest).fillna(init_elo)
+
+    # Win rate
+    def get_win_rate(df, team, is_home=True):
+        cond = (df["HomeTeam"] == team) if is_home else (df["AwayTeam"] == team)
+        win = (df[cond]["Full Time Home Goals"] > df[cond]["Full Time Away Goals"]) if is_home else \
+              (df[cond]["Full Time Away Goals"] > df[cond]["Full Time Home Goals"])
+        return win.tail(k).mean() if not win.empty else 0.0
+
+    home_win_rate_k = df_baseline["HomeTeam"].apply(lambda t: get_win_rate(df_hist, t, True))
+    away_win_rate_k = df_baseline["AwayTeam"].apply(lambda t: get_win_rate(df_hist, t, False))
+    df_baseline["Home_adv_elo"] = (home_win_rate_k - away_win_rate_k + adv_const) * elo_scale
+
+    # Head-to-Head
+    def get_h2h_stats(df, h, a):
+        matches = df[((df["HomeTeam"] == h) & (df["AwayTeam"] == a)) |
+                     ((df["HomeTeam"] == a) & (df["AwayTeam"] == h))].tail(k)
+        score = gs_H = gs_A = 0
+        for _, r in matches.iterrows():
+            is_home = r["HomeTeam"] == h
+            result = np.sign(r["Full Time Home Goals"] - r["Full Time Away Goals"])
+            result = result if is_home else -result
+            score += result
+            gs_H += r["Full Time Home Goals"] if is_home else r["Full Time Away Goals"]
+            gs_A += r["Full Time Away Goals"] if is_home else r["Full Time Home Goals"]
+        n = len(matches)
+        return pd.Series({
+            "H2H_score": score,
+            "H2H_GS_H_total": gs_H,
+            "H2H_GS_A_total": gs_A,
+            "H2H_GS_H_avg": gs_H / n if n else 0.0,
+            "H2H_GS_A_avg": gs_A / n if n else 0.0
+        })
+
+    h2h_df = df_baseline.apply(lambda r: get_h2h_stats(df_hist, r["HomeTeam"], r["AwayTeam"]), axis=1)
+    df_baseline = pd.concat([df_baseline, h2h_df], axis=1)
+
+    # Merge last stats
+    latest_home = df_hist.drop_duplicates("HomeTeam", keep="last").set_index("HomeTeam")
+    latest_away = df_hist.drop_duplicates("AwayTeam", keep="last").set_index("AwayTeam")
+
+    home_features = [
+        "GoalsScore_H", "GoalsAgainst_H", "GoalDifference_H",
+        "WinStreak_H", "LoseStreak_H", "Wins_H", "Losses_H", "WinRate_H",
+        "GoalsScore_H_avg", "GoalsAgainst_H_avg"
+    ]
+    away_features = [
+        "GoalsScore_A", "GoalsAgainst_A", "GoalDifference_A",
+        "WinStreak_A", "LoseStreak_A", "Wins_A", "Losses_A", "WinRate_A",
+        "GoalsScore_A_avg", "GoalsAgainst_A_avg"
+    ]
+
+    df_baseline = df_baseline.merge(latest_home[home_features], left_on="HomeTeam", right_index=True, how="left")
+    df_baseline = df_baseline.merge(latest_away[away_features], left_on="AwayTeam", right_index=True, how="left")
+
+    # Feature engineering
+    df_baseline["Elo_diff"] = df_baseline["Elo_H_before"] - df_baseline["Elo_A_before"]
+    df_baseline["Elo_ratio"] = df_baseline["Elo_H_before"] / df_baseline["Elo_A_before"]
+    df_baseline["Goals_likelyhood_H"] = df_baseline["GoalsScore_H_avg"] + df_baseline["GoalsAgainst_A_avg"]
+    df_baseline["Goals_likelyhood_A"] = df_baseline["GoalsScore_A_avg"] + df_baseline["GoalsAgainst_H_avg"]
+    df_baseline["Home_adv_elo_sum"] = df_baseline["Elo_H_before"] + df_baseline["Home_adv_elo"]
+
+    # Encode
+    team_cols = ["HomeTeam", "AwayTeam"]
+    le = LabelEncoder()
+    all_teams = pd.concat([df_baseline[col] for col in team_cols]).unique()
+    le.fit(all_teams)
+    for col in team_cols:
+        df_baseline[col + "_code"] = le.transform(df_baseline[col])
+
+    return df_baseline
 
 # -------------------------
-# Feature engineering (as in notebook)
+# Feature engineering 
 # -------------------------
 def feature_engineering_df(df: pd.DataFrame) -> pd.DataFrame:
     if {"Elo_H_before", "Elo_A_before"}.issubset(df.columns):
@@ -180,9 +509,41 @@ def render_scoreboard(home_team: str, away_team: str, g_home: int, g_away: int):
 
 
 
+def _discover_model_pairs(models_dir: str) -> Dict[str, Dict[str, str]]:
+    pairs: Dict[str, Dict[str, str]] = {}
+    try:
+        files = os.listdir(models_dir)
+    except Exception:
+        files = []
+
+    # Legacy default pair
+    if "home_model.pkl" in files and "away_model.pkl" in files:
+        pairs["default"] = {
+            "home": os.path.join(models_dir, "home_model.pkl"),
+            "away": os.path.join(models_dir, "away_model.pkl"),
+        }
+
+    # Pattern: home_<name>_model.pkl and away_<name>_model.pkl
+    for fname in files:
+        if fname.startswith("home_") and fname.endswith("_model.pkl"):
+            middle = fname[len("home_"):-len("_model.pkl")]
+            away_name = f"away_{middle}_model.pkl"
+            if away_name in files:
+                pairs[middle] = {
+                    "home": os.path.join(models_dir, fname),
+                    "away": os.path.join(models_dir, away_name),
+                }
+    return pairs
+
+
 @st.cache_resource(show_spinner=True)
 def load_models_and_metrics(csv_path: str):
     df = read_dataset(csv_path)
+    # Separate dataset for head-to-head lookup
+    try:
+        df_h2h = read_dataset(H2H_DATA_PATH)
+    except Exception:
+        df_h2h = df.copy()
 
     if not (os.path.exists(MODEL_HOME_PATH) and os.path.exists(MODEL_AWAY_PATH)):
         st.error("Chưa có mô hình. Vui lòng mở notebook 'eda_and_train.ipynb' để huấn luyện và lưu mô hình vào ./models/.")
@@ -239,7 +600,38 @@ def load_models_and_metrics(csv_path: str):
     except Exception:
         pass
 
-    return df, model_home, model_away, feature_cols, (team_to_code or inferred_map), cols_to_norm, scaler
+    # Discover available model pairs and pick default
+    model_pairs = _discover_model_pairs(os.path.join(os.getcwd(), "models"))
+    selected_key = None
+    # Preference order: 'rf' then 'default' then first available
+    if "rf" in model_pairs:
+        selected_key = "rf"
+    elif "default" in model_pairs:
+        selected_key = "default"
+    elif model_pairs:
+        selected_key = sorted(model_pairs.keys())[0]
+
+    # Load selected models; fallback to configured paths
+    try:
+        if selected_key:
+            model_home = load(model_pairs[selected_key]["home"])
+            model_away = load(model_pairs[selected_key]["away"])
+    except Exception:
+        # keep previously loaded model_home/model_away
+        pass
+
+    return (
+        df,
+        df_h2h,
+        model_home,
+        model_away,
+        feature_cols,
+        (team_to_code or inferred_map),
+        cols_to_norm,
+        scaler,
+        model_pairs,
+        selected_key,
+    )
 
 
 def _mean_or_nan(series: pd.Series) -> float:
@@ -485,33 +877,82 @@ def predict_score(model_home: Any, model_away: Any, X_row: pd.DataFrame) -> Tupl
 # -------------------------
 # UI
 # -------------------------
-st.title("⚽ Dự đoán tỉ số bóng đá bằng XGBoost")
-st.caption(
-    "Huấn luyện mô hình từ dữ liệu lịch sử và dự đoán tỉ số cho cặp đấu được chọn."
-)
+st.title("⚽ Dự đoán tỉ số bóng đá")
+st.caption("Dự đoán tỉ số cho cặp đấu được chọn từ dữ liệu lịch sử.")
 
 data_path = DEFAULT_DATA_PATH
 
 if "_cache_models" not in st.session_state:
     with st.spinner("Đang tải mô hình đã huấn luyện..."):
-        df, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler = load_models_and_metrics(data_path)
-        st.session_state["_cache_models"] = (df, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler)
+        (
+            df,
+            df_h2h,
+            model_home,
+            model_away,
+            feature_cols,
+            team_to_code,
+            cols_to_norm,
+            scaler,
+            model_pairs,
+            selected_model_key,
+        ) = load_models_and_metrics(data_path)
+        st.session_state["_cache_models"] = (
+            df,
+            df_h2h,
+            model_home,
+            model_away,
+            feature_cols,
+            team_to_code,
+            cols_to_norm,
+            scaler,
+            model_pairs,
+            selected_model_key,
+        )
 
-df, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler = st.session_state.get(
-    "_cache_models", load_models_and_metrics(data_path)
-)
+(
+    df,
+    df_h2h,
+    model_home,
+    model_away,
+    feature_cols,
+    team_to_code,
+    cols_to_norm,
+    scaler,
+    model_pairs,
+    selected_model_key,
+) = st.session_state.get("_cache_models", load_models_and_metrics(data_path))
 
-# Only allow teams present in the Test season 2024-07-01 → 2025-06-30
-
+# Teams list for selection
 df_test = df.copy()
 teams_sorted = sorted(
     set(df_test.get("HomeTeam", pd.Series(dtype=str)).dropna().unique())
     | set(df_test.get("AwayTeam", pd.Series(dtype=str)).dropna().unique())
 )
 
-main_col = st.columns([1, 2, 1])[1]
+main_col = st.container()
 with main_col:
-    st.subheader("Chọn cặp đấu (chỉ đội trong tập Test 2024-2025)")
+    st.subheader("Chọn mô hình và cặp đấu")
+    # Model picker
+    model_keys = sorted(model_pairs.keys())
+    if not model_keys:
+        st.error("Không tìm thấy mô hình trong thư mục models/.")
+        model_choice = None
+    else:
+        default_index = model_keys.index(selected_model_key) if selected_model_key in model_keys else 0
+        model_choice = st.selectbox("Mô hình", options=model_keys, index=default_index, key="model_select")
+        # If user changed model, reload models
+        prev_model_choice = st.session_state.get("_model_choice")
+        if model_choice and model_choice != prev_model_choice:
+            try:
+                model_home = load(model_pairs[model_choice]["home"])
+                model_away = load(model_pairs[model_choice]["away"])
+                st.session_state["_model_choice"] = model_choice
+                # update cache tuple
+                st.session_state["_cache_models"] = (
+                    df, df_h2h, model_home, model_away, feature_cols, team_to_code, cols_to_norm, scaler, model_pairs, model_choice
+                )
+            except Exception as _e:
+                st.warning(f"Không thể tải mô hình '{model_choice}'. Dùng mô hình trước đó.")
     if len(teams_sorted) == 0:
         st.error("Không tìm thấy đội nào trong tập Test 2024-2025.")
         home_team, away_team, predict_btn = None, None, False
@@ -553,11 +994,12 @@ with main_col:
     disp_away = st.session_state.get("_score_away")
     disp_home = disp_home if disp_home is not None else "?"
     disp_away = disp_away if disp_away is not None else "?"
+
     if home_team and away_team and home_team != away_team:
         render_scoreboard(home_team, away_team, disp_home, disp_away)
 
         # Optional debug: show raw predictions
-        with st.expander("Chi tiết dự đoán (debug)"):
+        with st.expander("Chi tiết dự đoán"):
             try:
                 raw_home = float(model_home.predict(X_row)[0])
                 raw_away = float(model_away.predict(X_row)[0])
@@ -568,8 +1010,158 @@ with main_col:
                     "AwayTeam_code": X_row.get("AwayTeam_code", pd.Series([None])).iloc[0],
                 })
             except Exception as e:
-                st.write(f"Không thể hiển thị debug: {e}")
+                st.write(f"Chọn dự đoán để xem")
+    # Head-to-head last 5 from data.csv
+    if home_team and away_team and home_team != away_team:
+        try:
+            mask_pair = (
+                ((df_h2h.get("HomeTeam") == home_team) & (df_h2h.get("AwayTeam") == away_team))
+                |
+                ((df_h2h.get("HomeTeam") == away_team) & (df_h2h.get("AwayTeam") == home_team))
+            )
+            cols = ["Date", "HomeTeam", "AwayTeam", TARGET_HOME, TARGET_AWAY]
+            cols = [c for c in cols if c in df_h2h.columns]
+            h2h = df_h2h.loc[mask_pair, cols].dropna()
+            if "Date" in h2h.columns:
+                h2h = h2h.sort_values("Date", ascending=False)
+                try:
+                    h2h["Date"] = pd.to_datetime(h2h["Date"], errors="coerce").dt.date.astype(str)
+                except Exception:
+                    pass
+            h2h = h2h.head(5).rename(columns={TARGET_HOME: "FT_Home", TARGET_AWAY: "FT_Away"})
+            st.subheader("Đối đầu gần nhất (tối đa 5 trận)")
+            st.dataframe(h2h.reset_index(drop=True), use_container_width=True)
+            # Custom H2H input below the table
+            with st.container():
+                st.subheader("Custome dataset")
+                st.caption("Tùy chỉnh tỉ số đối đầu (số trận tùy ý)")
+                st.checkbox(
+                    "Sử dụng custom dataset cho dự đoán",
+                    value=bool(st.session_state.get("_use_custom_h2h", False)),
+                    key="_use_custom_h2h",
+                )
+                # Team options from dataset, excluding the currently selected home/away
+                all_teams = sorted(
+                    set(df.get("HomeTeam", pd.Series(dtype=str)).dropna().unique())
+                    | set(df.get("AwayTeam", pd.Series(dtype=str)).dropna().unique())
+                )
+                team_options_home = [t for t in all_teams if t != home_team]
+                team_options_away = [t for t in all_teams if t != away_team]
 
+                # Safe updater for count per panel
+                def _inc_count(prefix: str, max_rows: int = 5):
+                    key = f"{prefix}_count"
+                    cur = int(st.session_state.get(key, 1))
+                    if cur < max_rows:
+                        st.session_state[key] = cur + 1
+
+                # Delete a specific row (by index) for a given panel
+                def _delete_row(prefix: str, idx: int):
+                    count_key = f"{prefix}_count"
+                    cur = int(st.session_state.get(count_key, 1))
+                    if cur <= 1:
+                        return
+                    keep_indices = [j for j in range(cur) if j != idx]
+                    # Repack values we keep
+                    teams = [st.session_state.get(f"{prefix}_team_{j}") for j in keep_indices]
+                    venues = [st.session_state.get(f"{prefix}_venue_{j}") for j in keep_indices]
+                    gfs = [st.session_state.get(f"{prefix}_gf_{j}") for j in keep_indices]
+                    gas = [st.session_state.get(f"{prefix}_ga_{j}") for j in keep_indices]
+                    new_count = max(1, cur - 1)
+                    # Write back compacted values
+                    for i2 in range(new_count):
+                        st.session_state[f"{prefix}_team_{i2}"] = teams[i2] if i2 < len(teams) else None
+                        st.session_state[f"{prefix}_venue_{i2}"] = venues[i2] if i2 < len(venues) else "Home"
+                        st.session_state[f"{prefix}_gf_{i2}"] = int(gfs[i2]) if i2 < len(gfs) and gfs[i2] is not None else 0
+                        st.session_state[f"{prefix}_ga_{i2}"] = int(gas[i2]) if i2 < len(gas) and gas[i2] is not None else 0
+                    # Clean up old keys
+                    for j in range(new_count, cur):
+                        for field in ("team", "venue", "gf", "ga"):
+                            k = f"{prefix}_{field}_{j}"
+                            if k in st.session_state:
+                                del st.session_state[k]
+                    st.session_state[count_key] = new_count
+
+                def render_custom_inputs(panel_title: str, team_options: List[str], default_venue: str, key_prefix: str, is_home_panel: bool):
+                    st.subheader(panel_title)
+                    st.write("Mỗi trận: chọn Đội, chọn Sân (Home/Away), nhập GF/GA")
+                    count_key = f"{key_prefix}_count"
+                    # Always start with 1 if no state; cap to max 5
+                    cur_count = st.session_state.get(count_key, 1)
+                    max_rows = 5
+                    if cur_count > max_rows:
+                        cur_count = max_rows
+                        st.session_state[count_key] = max_rows
+                    # Render rows
+                    for i in range(cur_count):
+                        # Read current values if any; DO NOT write to session_state before widget creation
+                        team_val = st.session_state.get(
+                            f"{key_prefix}_team_{i}", team_options[0] if len(team_options) > 0 else None
+                        )
+                        venue_val = st.session_state.get(f"{key_prefix}_venue_{i}", default_venue)
+                        gf_val = int(st.session_state.get(f"{key_prefix}_gf_{i}", 0))
+                        ga_val = int(st.session_state.get(f"{key_prefix}_ga_{i}", 0))
+                        c0, c1, c2, c3, c4, c5 = st.columns([0.6, 1.6, 1.2, 1.0, 1.0, 0.6])
+                        with c0:
+                            st.markdown(f"Trận {i+1}")
+                        with c1:
+                            st.selectbox(
+                                "Đội",
+                                options=team_options,
+                                index=(team_options.index(team_val) if team_options and team_val in team_options else (0 if team_options else 0)),
+                                key=f"{key_prefix}_team_{i}",
+                            )
+                        with c2:
+                            st.selectbox(
+                                "Sân",
+                                options=["Home", "Away"],
+                                index=0 if venue_val == "Home" else 1,
+                                key=f"{key_prefix}_venue_{i}",
+                            )
+                        with c3:
+                            st.number_input(
+                                "GF",
+                                min_value=0,
+                                max_value=15,
+                                value=gf_val,
+                                key=f"{key_prefix}_gf_{i}",
+                            )
+                        with c4:
+                            st.number_input(
+                                "GA",
+                                min_value=0,
+                                max_value=15,
+                                value=ga_val,
+                                key=f"{key_prefix}_ga_{i}",
+                            )
+                        with c5:
+                            st.button(
+                                "✕",
+                                key=f"del_{key_prefix}_{i}",
+                                disabled=(cur_count <= 1),
+                                on_click=_delete_row,
+                                args=(key_prefix, i),
+                            )
+                    # Add row button (per column) with max 5 rows
+                    add_disabled = cur_count >= max_rows
+                    st.button(
+                        "+ Thêm trận",
+                        key=f"add_{key_prefix}",
+                        disabled=add_disabled,
+                        on_click=_inc_count,
+                        args=(key_prefix, max_rows),
+                    )
+                    if add_disabled:
+                        st.caption("Đã đạt tối đa 5 trận.")
+                        
+                col_left, col_right = st.columns(2)
+                with col_left:
+                    render_custom_inputs("Đội nhà ", team_options_home, "Home", "custom_home", True)
+                with col_right:
+                    render_custom_inputs("Đội khách", team_options_away, "Away", "custom_away", False)
+        except Exception as e:
+            st.info("Không lấy được lịch sử đối đầu.")
+            st.exception(e)  
    
 
     st.markdown("---")
@@ -577,6 +1169,7 @@ with main_col:
     if predict_btn and home_team and away_team and home_team != away_team:
         X_row = show_stats(df, home_team, away_team, feature_cols, team_to_code)
         st.dataframe(X_row.T.rename(columns={0: "Giá trị"}), use_container_width=True)
+
 
     with st.expander("Ghi chú & Hướng dẫn"):
         st.markdown(
@@ -588,4 +1181,5 @@ with main_col:
             """
         )
 
+    
 
