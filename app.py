@@ -199,9 +199,20 @@ def load_models_and_metrics(csv_path: str):
     except Exception:
         team_to_code = {}
     if not team_to_code:
-        st.warning("Không có mapping team->code. Sẽ cố gắng suy luận, nhưng nên dump đúng từ notebook.")
+        st.warning("Không có mapping team->code. Sẽ cố gắng suy luận từ dữ liệu, nhưng nên dump đúng từ notebook.")
 
-    return df, model_home, model_away, feature_cols, team_to_code
+    # Build fallback mapping from dataset if needed
+    try:
+        all_teams_series = pd.concat([
+            df.get("HomeTeam", pd.Series(dtype=str)),
+            df.get("AwayTeam", pd.Series(dtype=str)),
+        ], axis=0).dropna().astype(str)
+        unique_teams = sorted(all_teams_series.unique())
+        inferred_map = {name: idx for idx, name in enumerate(unique_teams)}
+    except Exception:
+        inferred_map = {}
+
+    return df, model_home, model_away, feature_cols, (team_to_code or inferred_map)
 
 
 def _mean_or_nan(series: pd.Series) -> float:
@@ -278,6 +289,25 @@ def build_input_row(
                 val = 0.0
         row[col] = val
 
+    # Compute derived features if model expects them
+    if "Elo_diff" in feature_cols and "Elo_diff" not in row:
+        row["Elo_diff"] = float(row.get("Elo_H_before", 0.0)) - float(row.get("Elo_A_before", 0.0))
+    if "Elo_ratio" in feature_cols and "Elo_ratio" not in row:
+        denom = float(row.get("Elo_A_before", 1.0)) or 1.0
+        row["Elo_ratio"] = float(row.get("Elo_H_before", 0.0)) / denom
+    if "Home_adv_elo_sum" in feature_cols and "Home_adv_elo_sum" not in row:
+        row["Home_adv_elo_sum"] = float(row.get("Home_adv_elo", 0.0))
+    if "Goals_likelyhood_H" in feature_cols and "Goals_likelyhood_H" not in row:
+        row["Goals_likelyhood_H"] = float(np.nanmean([
+            row.get("GoalsScore_H_avg", np.nan),
+            row.get("GoalsAgainst_A_avg", np.nan),
+        ])) if not (np.isnan(row.get("GoalsScore_H_avg", np.nan)) and np.isnan(row.get("GoalsAgainst_A_avg", np.nan))) else 0.0
+    if "Goals_likelyhood_A" in feature_cols and "Goals_likelyhood_A" not in row:
+        row["Goals_likelyhood_A"] = float(np.nanmean([
+            row.get("GoalsScore_A_avg", np.nan),
+            row.get("GoalsAgainst_H_avg", np.nan),
+        ])) if not (np.isnan(row.get("GoalsScore_A_avg", np.nan)) and np.isnan(row.get("GoalsAgainst_H_avg", np.nan))) else 0.0
+
     # Build DataFrame and align to training feature columns order
     row_df = pd.DataFrame([row])
     # Ensure all required columns exist
@@ -290,7 +320,9 @@ def build_input_row(
     for col in row_df.columns:
         if col not in CATEGORICAL_FEATURES:
             row_df[col] = pd.to_numeric(row_df[col], errors="coerce")
-    # Fill any NaNs with column medians (fallback 0.0)
+    # Fill NaNs: if codes missing, don't silently zero – try fallback based on overall index
+    if np.isnan(row_df["HomeTeam_code"].iloc[0]) or np.isnan(row_df["AwayTeam_code"].iloc[0]):
+        st.warning("Thiếu mã đội (code) cho một trong hai đội. Đang dùng suy luận tạm thời.")
     row_df = row_df.fillna(row_df.median(numeric_only=True)).fillna(0.0)
     return row_df
 
@@ -378,6 +410,20 @@ with main_col:
     disp_away = disp_away if disp_away is not None else "?"
     if home_team and away_team and home_team != away_team:
         render_scoreboard(home_team, away_team, disp_home, disp_away)
+
+        # Optional debug: show raw predictions
+        with st.expander("Chi tiết dự đoán (debug)"):
+            try:
+                raw_home = float(model_home.predict(X_row)[0])
+                raw_away = float(model_away.predict(X_row)[0])
+                st.write({
+                    "raw_home_pred": round(raw_home, 4),
+                    "raw_away_pred": round(raw_away, 4),
+                    "HomeTeam_code": X_row.get("HomeTeam_code", pd.Series([None])).iloc[0],
+                    "AwayTeam_code": X_row.get("AwayTeam_code", pd.Series([None])).iloc[0],
+                })
+            except Exception as e:
+                st.write(f"Không thể hiển thị debug: {e}")
 
     # Head-to-head (last 5, exclude Test period)
     if home_team and away_team and home_team != away_team:
