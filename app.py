@@ -1,6 +1,6 @@
 import os
 import base64
-import json
+import json as _json
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -19,8 +19,10 @@ st.set_page_config(
 )
 
 DEFAULT_DATA_PATH = os.path.join(os.getcwd(), "dataset", "data.csv")
-MODEL_HOME_PATH = os.path.join(os.getcwd(), "models", "home_model.pkl")
-MODEL_AWAY_PATH = os.path.join(os.getcwd(), "models", "away_model.pkl")
+MODEL_HOME_PATH = os.path.join(os.getcwd(), "models", "home_rf_model.pkl")
+MODEL_AWAY_PATH = os.path.join(os.getcwd(), "models", "away_rf_model.pkl")
+FEATURE_COLS_PATH = os.path.join(os.getcwd(), "models", "feature_cols.json")
+TEAM_ENCODER_PATH = os.path.join(os.getcwd(), "models", "team_encoder.json")
 TARGET_HOME = "Full Time Home Goals"
 TARGET_AWAY = "Full Time Away Goals"
 CATEGORICAL_FEATURES = ["HomeTeam", "AwayTeam"]
@@ -134,22 +136,24 @@ def render_scoreboard(home_team: str, away_team: str, g_home: int, g_away: int):
     b64_home = _logo_b64(home_team)
     b64_away = _logo_b64(away_team)
     html = f'''
-    <div style="margin-top:8px;border-radius:12px;background:#1f2937;padding:16px;">
-      <div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;color:#e5e7eb;">
-        <div style="text-align:center;">
-          <img src="data:image/png;base64,{b64_home}" style="width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px;"/>
-          <div style="font-size:16px;">{home_team}</div>
-        </div>
-        <div style="text-align:center;">
-          <div style="font-weight:700;font-size:52px;line-height:1;letter-spacing:1px;">
-            {g_home}
-            <span style="opacity:.7;margin:0 16px;">-</span>
-            {g_away}
+    <div style="display:flex;justify-content:center;width:100%;">
+      <div style="margin-top:8px;border-radius:12px;background:#1f2937;padding:16px;max-width:680px;width:100%;">
+        <div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;color:#e5e7eb;">
+          <div style="text-align:center;">
+            <img src="data:image/png;base64,{b64_home}" style="width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px;"/>
+            <div style="font-size:16px;">{home_team}</div>
           </div>
-        </div>
-        <div style="text-align:center;">
-          <img src="data:image/png;base64,{b64_away}" style="width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px;"/>
-          <div style="font-size:16px;">{away_team}</div>
+          <div style="text-align:center;">
+            <div style="font-weight:700;font-size:52px;line-height:1;letter-spacing:1px;">
+              {g_home}
+              <span style="opacity:.7;margin:0 16px;">-</span>
+              {g_away}
+            </div>
+          </div>
+          <div style="text-align:center;">
+            <img src="data:image/png;base64,{b64_away}" style="width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px;"/>
+            <div style="font-size:16px;">{away_team}</div>
+          </div>
         </div>
       </div>
     </div>
@@ -172,19 +176,32 @@ def load_models_and_metrics(csv_path: str):
     model_home = load(MODEL_HOME_PATH)
     model_away = load(MODEL_AWAY_PATH)
 
-    metrics_path = os.path.join(os.getcwd(), "models", "metrics.json")
-    metrics: Dict[str, Any]
-    if os.path.exists(metrics_path):
-        try:
-            import json as _json
-            with open(metrics_path, "r") as f:
-                metrics = _json.load(f)
-        except Exception:
-            metrics = {}
-    else:
-        metrics = {}
+    # Load feature columns used during training
+    if not os.path.exists(FEATURE_COLS_PATH):
+        st.error("Thiếu file models/feature_cols.json. Vui lòng dump metadata từ notebook.")
+        st.stop()
+    try:
+        with open(FEATURE_COLS_PATH, "r") as f:
+            feature_cols = _json.load(f).get("feature_cols", [])
+    except Exception:
+        feature_cols = []
+    if not feature_cols:
+        st.error("Danh sách cột huấn luyện trống. Vui lòng dump lại feature_cols từ notebook.")
+        st.stop()
 
-    return df, model_home, model_away, metrics
+    # Load team encoder mapping {team_name -> code}
+    if not os.path.exists(TEAM_ENCODER_PATH):
+        st.error("Thiếu file models/team_encoder.json. Vui lòng dump metadata từ notebook.")
+        st.stop()
+    try:
+        with open(TEAM_ENCODER_PATH, "r") as f:
+            team_to_code = _json.load(f).get("to_code", {})
+    except Exception:
+        team_to_code = {}
+    if not team_to_code:
+        st.warning("Không có mapping team->code. Sẽ cố gắng suy luận, nhưng nên dump đúng từ notebook.")
+
+    return df, model_home, model_away, feature_cols, team_to_code
 
 
 def _mean_or_nan(series: pd.Series) -> float:
@@ -194,7 +211,13 @@ def _mean_or_nan(series: pd.Series) -> float:
     return float(series.mean())
 
 
-def build_input_row(df: pd.DataFrame, home_team: str, away_team: str) -> pd.DataFrame:
+def build_input_row(
+    df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+    feature_cols: List[str],
+    team_to_code: Dict[str, int],
+) -> pd.DataFrame:
     """Construct a single-row feature DataFrame for a given matchup by aggregating
     team-specific historical statistics from the dataset.
 
@@ -204,9 +227,7 @@ def build_input_row(df: pd.DataFrame, home_team: str, away_team: str) -> pd.Data
     - Other numeric columns: prefer head-to-head mean for this pairing; fallback to
       per-team means (home or away as available); else global mean.
     """
-    feature_columns: List[str] = [
-        c for c in df.columns if c not in EXCLUDE_COLUMNS
-    ]
+    feature_columns: List[str] = [c for c in df.columns if c not in EXCLUDE_COLUMNS]
 
     row: Dict[str, float] = {}
 
@@ -215,9 +236,12 @@ def build_input_row(df: pd.DataFrame, home_team: str, away_team: str) -> pd.Data
         if cat not in feature_columns:
             feature_columns.append(cat)
 
-    # Populate categorical
+    # Populate categorical names
     row["HomeTeam"] = home_team
     row["AwayTeam"] = away_team
+    # And codes expected by the model
+    row["HomeTeam_code"] = float(team_to_code.get(home_team, np.nan))
+    row["AwayTeam_code"] = float(team_to_code.get(away_team, np.nan))
 
     # Numeric columns
     numeric_cols = [
@@ -254,7 +278,21 @@ def build_input_row(df: pd.DataFrame, home_team: str, away_team: str) -> pd.Data
                 val = 0.0
         row[col] = val
 
-    return pd.DataFrame([row])[feature_columns]
+    # Build DataFrame and align to training feature columns order
+    row_df = pd.DataFrame([row])
+    # Ensure all required columns exist
+    for col in feature_cols:
+        if col not in row_df.columns:
+            row_df[col] = 0.0
+    # Select and order
+    row_df = row_df[feature_cols]
+    # Coerce to numeric where possible
+    for col in row_df.columns:
+        if col not in CATEGORICAL_FEATURES:
+            row_df[col] = pd.to_numeric(row_df[col], errors="coerce")
+    # Fill any NaNs with column medians (fallback 0.0)
+    row_df = row_df.fillna(row_df.median(numeric_only=True)).fillna(0.0)
+    return row_df
 
 
 def predict_score(model_home: Any, model_away: Any, X_row: pd.DataFrame) -> Tuple[int, int]:
@@ -278,10 +316,12 @@ data_path = DEFAULT_DATA_PATH
 
 if "_cache_models" not in st.session_state:
     with st.spinner("Đang tải mô hình đã huấn luyện..."):
-        df, model_home, model_away, metrics = load_models_and_metrics(data_path)
-        st.session_state["_cache_models"] = (df, model_home, model_away, metrics)
+        df, model_home, model_away, feature_cols, team_to_code = load_models_and_metrics(data_path)
+        st.session_state["_cache_models"] = (df, model_home, model_away, feature_cols, team_to_code)
 
-df, model_home, model_away, metrics = st.session_state.get("_cache_models", load_models_and_metrics(data_path))
+df, model_home, model_away, feature_cols, team_to_code = st.session_state.get(
+    "_cache_models", load_models_and_metrics(data_path)
+)
 
 # Only allow teams present in the Test season 2024-07-01 → 2025-06-30
 test_start = pd.Timestamp("2024-07-01")
@@ -292,8 +332,8 @@ teams_sorted = sorted(
     | set(df_test.get("AwayTeam", pd.Series(dtype=str)).dropna().unique())
 )
 
-col_left, col_right = st.columns([1, 1])
-with col_left:
+main_col = st.columns([1, 2, 1])[1]
+with main_col:
     st.subheader("Chọn cặp đấu (chỉ đội trong tập Test 2024-2025)")
     if len(teams_sorted) == 0:
         st.error("Không tìm thấy đội nào trong tập Test 2024-2025.")
@@ -317,88 +357,62 @@ with col_left:
                 key="away_select",
             )
         predict_btn = st.button("Dự đoán tỉ số")
-        # Persist scoreboard and show ?-? before prediction
-        teams_key = f"{home_team}__{away_team}" if home_team and away_team else None
-        prev_key = st.session_state.get("_teams_key")
-        if teams_key and teams_key != prev_key:
-            st.session_state["_teams_key"] = teams_key
-            st.session_state["_score_home"] = None
-            st.session_state["_score_away"] = None
 
-        if predict_btn:
-            if not home_team or not away_team:
-                st.error("Vui lòng chọn đội nhà và đội khách hợp lệ.")
-            elif home_team == away_team:
-                st.error("Đội nhà và đội khách không được trùng nhau.")
-            else:
-                X_row = build_input_row(df, home_team, away_team)
-                g_home, g_away = predict_score(model_home, model_away, X_row)
-                st.session_state["_score_home"] = g_home
-                st.session_state["_score_away"] = g_away
+    # Reset score on team change
+    teams_key = f"{home_team}__{away_team}" if (home_team and away_team) else None
+    prev_key = st.session_state.get("_teams_key")
+    if teams_key and teams_key != prev_key:
+        st.session_state["_teams_key"] = teams_key
+        st.session_state["_score_home"] = None
+        st.session_state["_score_away"] = None
 
-        disp_home = st.session_state.get("_score_home")
-        disp_away = st.session_state.get("_score_away")
-        disp_home = disp_home if disp_home is not None else "?"
-        disp_away = disp_away if disp_away is not None else "?"
-        if home_team and away_team:
-            render_scoreboard(home_team, away_team, disp_home, disp_away)
+    if predict_btn and home_team and away_team and home_team != away_team:
+        X_row = build_input_row(df, home_team, away_team, feature_cols, team_to_code)
+        g_home, g_away = predict_score(model_home, model_away, X_row)
+        st.session_state["_score_home"] = g_home
+        st.session_state["_score_away"] = g_away
 
-with col_right:
-    st.subheader("Chất lượng mô hình")
-    st.caption("Theo mùa: Val 2023-2024, Test 2024-2025 (từ notebook)")
+    disp_home = st.session_state.get("_score_home")
+    disp_away = st.session_state.get("_score_away")
+    disp_home = disp_home if disp_home is not None else "?"
+    disp_away = disp_away if disp_away is not None else "?"
+    if home_team and away_team and home_team != away_team:
+        render_scoreboard(home_team, away_team, disp_home, disp_away)
 
-    def _fmt(mdict: Dict, split: str, side: str, key: str) -> str:
+    # Head-to-head (last 5, exclude Test period)
+    if home_team and away_team and home_team != away_team:
         try:
-            val = mdict[split][side][key]
-            if val is None:
-                return "N/A"
-            return f"{float(val):.3f}"
+            mask_pair = (
+                ((df.get("HomeTeam") == home_team) & (df.get("AwayTeam") == away_team))
+                |
+                ((df.get("HomeTeam") == away_team) & (df.get("AwayTeam") == home_team))
+            )
+            mask_time = df.get("Date") < test_start
+            df_h2h = df[mask_pair & mask_time][["Date", "HomeTeam", "AwayTeam", TARGET_HOME, TARGET_AWAY]].dropna()
+            df_h2h = df_h2h.sort_values("Date", ascending=False).head(5).copy()
+            df_h2h["Date"] = pd.to_datetime(df_h2h["Date"], errors="coerce").dt.date.astype(str)
+            df_h2h = df_h2h.rename(columns={TARGET_HOME: "FT_Home", TARGET_AWAY: "FT_Away"})
+            st.subheader("Đối đầu gần nhất (tối đa 5 trận)")
+            st.dataframe(df_h2h.reset_index(drop=True), use_container_width=True)
         except Exception:
-            return "N/A"
+            st.info("Không lấy được lịch sử đối đầu.")
 
-    st.markdown("Val 2023-2024")
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("MAE (Home)", _fmt(metrics, "val", "home", "MAE"))
-        st.metric("MAE (Away)", _fmt(metrics, "val", "away", "MAE"))
-    with m2:
-        st.metric("RMSE (Home)", _fmt(metrics, "val", "home", "RMSE"))
-        st.metric("RMSE (Away)", _fmt(metrics, "val", "away", "RMSE"))
-    with m3:
-        st.metric("R2 (Home)", _fmt(metrics, "val", "home", "R2"))
-        st.metric("R2 (Away)", _fmt(metrics, "val", "away", "R2"))
-
-    st.markdown("Test 2024-2025")
-    t1, t2, t3 = st.columns(3)
-    with t1:
-        st.metric("MAE (Home)", _fmt(metrics, "test", "home", "MAE"))
-        st.metric("MAE (Away)", _fmt(metrics, "test", "away", "MAE"))
-    with t2:
-        st.metric("RMSE (Home)", _fmt(metrics, "test", "home", "RMSE"))
-        st.metric("RMSE (Away)", _fmt(metrics, "test", "away", "RMSE"))
-    with t3:
-        st.metric("R2 (Home)", _fmt(metrics, "test", "home", "R2"))
-        st.metric("R2 (Away)", _fmt(metrics, "test", "away", "R2"))
-
-st.markdown("---")
-output_col2 = st.container()
-
-with output_col2:
+    st.markdown("---")
     st.subheader("Đầu vào ước lượng (từ thống kê lịch sử)")
     if predict_btn and home_team and away_team and home_team != away_team:
         st.dataframe(
-            build_input_row(df, home_team, away_team).T.rename(columns={0: "Giá trị"}),
+            build_input_row(df, home_team, away_team, feature_cols, team_to_code).T.rename(columns={0: "Giá trị"}),
             use_container_width=True,
         )
 
-with st.expander("Ghi chú & Hướng dẫn"):
-    st.markdown(
-        """
-        - Ứng dụng sử dụng 2 mô hình XGBoost Regression để dự đoán số bàn của đội nhà và đội khách.
-        - Đặc trưng đầu vào gồm: one-hot của `HomeTeam`/`AwayTeam` và các cột số trong dữ liệu (ví dụ Elo, chuỗi trận, trung bình bàn thắng/thua,...).
-        - Khi dự đoán cho cặp đấu mới, các đặc trưng số được ước lượng bằng trung bình có trọng số theo vai trò (Home/ Away) và đối đầu trực tiếp nếu có.
-        - Các kết quả chỉ mang tính tham khảo, không dùng cho mục đích cá cược.
-        """
-    )
+    with st.expander("Ghi chú & Hướng dẫn"):
+        st.markdown(
+            """
+            - Ứng dụng sử dụng 2 mô hình XGBoost Regression để dự đoán số bàn của đội nhà và đội khách.
+            - Đặc trưng đầu vào gồm: one-hot của `HomeTeam`/`AwayTeam` và các cột số trong dữ liệu (ví dụ Elo, chuỗi trận, trung bình bàn thắng/thua,...).
+            - Khi dự đoán cho cặp đấu mới, các đặc trưng số được ước lượng bằng trung bình có trọng số theo vai trò (Home/ Away) và đối đầu trực tiếp nếu có.
+            - Các kết quả chỉ mang tính tham khảo, không dùng cho mục đích cá cược.
+            """
+        )
 
 
