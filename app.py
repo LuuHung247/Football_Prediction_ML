@@ -2,12 +2,14 @@ import os
 import base64
 import json as _json
 from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from collections import defaultdict, deque
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from joblib import load
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 
 # -------------------------
@@ -985,10 +987,60 @@ with main_col:
         st.session_state["_score_away"] = None
 
     if predict_btn and home_team and away_team and home_team != away_team:
-        X_row = preprocessing(df, home_team, away_team, feature_cols, team_to_code, cols_to_norm, scaler)
-        g_home, g_away = predict_score(model_home, model_away, X_row)
-        st.session_state["_score_home"] = g_home
-        st.session_state["_score_away"] = g_away
+        # If custom df_final is present and enabled, use only the selected matchup from it; else use regular preprocessing
+        if st.session_state.get("_use_custom_h2h", False) and st.session_state.get("_df_final_custom") is not None:
+            df_final_custom = st.session_state.get("_df_final_custom")
+            try:
+                sel = df_final_custom[(df_final_custom["HomeTeam"] == home_team) & (df_final_custom["AwayTeam"] == away_team)]
+                if sel.empty:
+                    st.error("Custom dataset không có cặp đấu đã chọn. Đang dùng dự đoán mặc định.")
+                    raise ValueError("Selected matchup not in custom df")
+                X_pred = sel[feature_cols].copy()
+                try:
+                    X_pred.loc[:, cols_to_norm] = scaler.transform(X_pred.loc[:, cols_to_norm])
+                except Exception:
+                    pass
+                # Ensure codes numeric for debug consistency
+                if "HomeTeam_code" in X_pred.columns:
+                    X_pred["HomeTeam_code"] = pd.to_numeric(X_pred["HomeTeam_code"], errors="coerce").fillna(0).astype(int)
+                if "AwayTeam_code" in X_pred.columns:
+                    X_pred["AwayTeam_code"] = pd.to_numeric(X_pred["AwayTeam_code"], errors="coerce").fillna(0).astype(int)
+                y_home_pred = model_home.predict(X_pred)
+                y_away_pred = model_away.predict(X_pred)
+                raw_home = float(y_home_pred[0] if not hasattr(y_home_pred, 'iloc') else y_home_pred.iloc[0])
+                raw_away = float(y_away_pred[0] if not hasattr(y_away_pred, 'iloc') else y_away_pred.iloc[0])
+                st.session_state["_raw_home"] = raw_home
+                st.session_state["_raw_away"] = raw_away
+                feats_row = X_pred.iloc[0].to_dict()
+                st.session_state["_last_features_row"] = feats_row
+                st.session_state["_score_home"] = int(np.rint(raw_home))
+                st.session_state["_score_away"] = int(np.rint(raw_away))
+                st.success("Đã dùng custom dataset cho dự đoán.")
+            except Exception as e:
+                st.error("Lỗi dùng custom dataset, chuyển sang dự đoán mặc định.")
+                st.exception(e)
+                X_row = preprocessing(df, home_team, away_team, feature_cols, team_to_code, cols_to_norm, scaler)
+                g_home, g_away = predict_score(model_home, model_away, X_row)
+                # store raw for debug consistency
+                try:
+                    st.session_state["_raw_home"] = float(model_home.predict(X_row)[0])
+                    st.session_state["_raw_away"] = float(model_away.predict(X_row)[0])
+                    st.session_state["_last_features_row"] = X_row.iloc[0].to_dict()
+                except Exception:
+                    pass
+                st.session_state["_score_home"] = g_home
+                st.session_state["_score_away"] = g_away
+        else:
+            X_row = preprocessing(df, home_team, away_team, feature_cols, team_to_code, cols_to_norm, scaler)
+            g_home, g_away = predict_score(model_home, model_away, X_row)
+            try:
+                st.session_state["_raw_home"] = float(model_home.predict(X_row)[0])
+                st.session_state["_raw_away"] = float(model_away.predict(X_row)[0])
+                st.session_state["_last_features_row"] = X_row.iloc[0].to_dict()
+            except Exception:
+                pass
+            st.session_state["_score_home"] = g_home
+            st.session_state["_score_away"] = g_away
 
     disp_home = st.session_state.get("_score_home")
     disp_away = st.session_state.get("_score_away")
@@ -1001,16 +1053,26 @@ with main_col:
         # Optional debug: show raw predictions
         with st.expander("Chi tiết dự đoán"):
             try:
-                raw_home = float(model_home.predict(X_row)[0])
-                raw_away = float(model_away.predict(X_row)[0])
-                st.write({
-                    "raw_home_pred": round(raw_home, 4),
-                    "raw_away_pred": round(raw_away, 4),
-                    "HomeTeam_code": X_row.get("HomeTeam_code", pd.Series([None])).iloc[0],
-                    "AwayTeam_code": X_row.get("AwayTeam_code", pd.Series([None])).iloc[0],
-                })
-            except Exception as e:
-                st.write(f"Chọn dự đoán để xem")
+                raw_home = st.session_state.get("_raw_home")
+                raw_away = st.session_state.get("_raw_away")
+                feats = st.session_state.get("_last_features_row", {})
+                if raw_home is None or raw_away is None:
+                    st.write("Chọn dự đoán để xem")
+                else:
+                    out = {
+                        "raw_home_pred": round(float(raw_home), 4),
+                        "raw_away_pred": round(float(raw_away), 4),
+                        "rounded_home": int(np.rint(float(raw_home))),
+                        "rounded_away": int(np.rint(float(raw_away))),
+                    }
+                    if feats:
+                        if "HomeTeam_code" in feats:
+                            out["HomeTeam_code"] = int(feats["HomeTeam_code"]) if feats["HomeTeam_code"] is not None else None
+                        if "AwayTeam_code" in feats:
+                            out["AwayTeam_code"] = int(feats["AwayTeam_code"]) if feats["AwayTeam_code"] is not None else None
+                    st.write(out)
+            except Exception:
+                st.write("Chọn dự đoán để xem")
     # Head-to-head last 5 from data.csv
     if home_team and away_team and home_team != away_team:
         try:
@@ -1113,7 +1175,7 @@ with main_col:
                             )
                         with c2:
                             st.selectbox(
-                                "Sân",
+                                "Sân (đội đang xét)",
                                 options=["Home", "Away"],
                                 index=0 if venue_val == "Home" else 1,
                                 key=f"{key_prefix}_venue_{i}",
@@ -1159,16 +1221,70 @@ with main_col:
                     render_custom_inputs("Đội nhà ", team_options_home, "Home", "custom_home", True)
                 with col_right:
                     render_custom_inputs("Đội khách", team_options_away, "Away", "custom_away", False)
+
+                # Build new_data from custom inputs if enabled
+                if st.session_state.get("_use_custom_h2h", False):
+                    def _collect(prefix: str, is_home: bool) -> List[Dict[str, Any]]:
+                        rows: List[Dict[str, Any]] = []
+                        cnt = int(st.session_state.get(f"{prefix}_count", 1))
+                        for i in range(cnt):
+                            team_sel = st.session_state.get(f"{prefix}_team_{i}")
+                            venue = st.session_state.get(f"{prefix}_venue_{i}", "Home")
+                            gf = int(st.session_state.get(f"{prefix}_gf_{i}", 0))
+                            ga = int(st.session_state.get(f"{prefix}_ga_{i}", 0))
+                            if team_sel is None:
+                                continue
+                            if is_home:
+                                # HomeTeam: current home_team; AwayTeam: selected opponent
+                                rows.append({
+                                    "HomeTeam": home_team,
+                                    "AwayTeam": team_sel,
+                                    "Full Time Home Goals": gf if venue == "Home" else ga,
+                                    "Full Time Away Goals": ga if venue == "Home" else gf,
+                                })
+                            else:
+                                # Away panel: venue is for current away_team (đội đang xét)
+                                if venue == "Home":
+                                    # away_team plays at Home
+                                    rows.append({
+                                        "HomeTeam": away_team,
+                                        "AwayTeam": team_sel,
+                                        "Full Time Home Goals": gf,
+                                        "Full Time Away Goals": ga,
+                                    })
+                                else:
+                                    # away_team plays Away
+                                    rows.append({
+                                        "HomeTeam": team_sel,
+                                        "AwayTeam": away_team,
+                                        "Full Time Home Goals": ga,
+                                        "Full Time Away Goals": gf,
+                                    })
+                        return rows
+
+                    new_rows_home = _collect("custom_home", True)
+                    new_rows_away = _collect("custom_away", False)
+                    new_rows = new_rows_home + new_rows_away
+                    if new_rows:
+                        # Prepare features and persist for main prediction button
+                        try:
+                            df_final = prepare_features_for_prediction(
+                                folder="data_season",
+                                new_data=new_rows,
+                                baseline_path="./data_extra/new_season.csv",
+                            )
+                            st.session_state["_df_final_custom"] = df_final.copy()
+                            st.success("Custom dataset đã sẵn sàng để dự đoán bằng nút bên trên.")
+                        except Exception as e:
+                            st.error("Không thể tạo đặc trưng từ custom dataset.")
+                            st.exception(e)
         except Exception as e:
             st.info("Không lấy được lịch sử đối đầu.")
             st.exception(e)  
    
 
+    # Separator
     st.markdown("---")
-    st.subheader("Đầu vào ước lượng (từ thống kê lịch sử)")
-    if predict_btn and home_team and away_team and home_team != away_team:
-        X_row = show_stats(df, home_team, away_team, feature_cols, team_to_code)
-        st.dataframe(X_row.T.rename(columns={0: "Giá trị"}), use_container_width=True)
 
 
     with st.expander("Ghi chú & Hướng dẫn"):
